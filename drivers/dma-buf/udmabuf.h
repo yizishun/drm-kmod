@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+// TODO: License
 #ifndef _UAPI_LINUX_UDMABUF_H
 #define _UAPI_LINUX_UDMABUF_H
 
