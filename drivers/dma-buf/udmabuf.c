@@ -119,18 +119,41 @@ static struct dma_buf_ops udmabuf_dmabuf_ops = {
 static struct sg_table * udmabuf_map(struct dma_buf_attachment *attachment,
 						enum dma_data_direction dir)
 {
-	// sg_alloc_table_from_pages [linuxkpi]
-	// dma_map_sgtable 	     [linuxkpi]
-	// sg_free_table	     [linuxkpi]
-	return NULL;
+	int err = 0;
+	struct sg_table *sgt;
+	struct udmabuf *ubuf;
+	
+	ubuf = attachment->dmabuf->priv;
+	if (ubuf == NULL)
+		return (ERR_PTR(-EINVAL));
+
+	sgt = malloc(sizeof(struct sg_table), M_UDMABUF, M_NOWAIT|M_ZERO);
+	if (sgt == NULL)
+		return (ERR_PTR(-ENOBUFS));
+
+	err = sg_alloc_table_from_pages(sgt, ubuf->pages, ubuf->count, 0,
+	    ubuf->count << PAGE_SHIFT, GFP_KERNEL);
+	if (err != 0) {
+		free(sgt, M_UDMABUF);
+		return (ERR_PTR(err));
+	}
+
+	err = dma_map_sgtable(attachment->dev, sgt, dir, 0);
+	if (err != 0) {
+		sg_free_table(sgt);
+		free(sgt, M_UDMABUF);
+		return (ERR_PTR(err));
+	}
+	return sgt;
 }
 
 static void udmabuf_unmap(struct dma_buf_attachment *attachment,
-					struct sg_table *sg,
+					struct sg_table *sgt,
 					enum dma_data_direction dir)
 {
-	// dma_unmap_sgtable         [linuxkpi]
-	// sg_free_table	     [linuxkpi]
+	dma_unmap_sgtable(attachment->dev, sgt, dir, 0);
+	sg_free_table(sgt);
+	free(sgt, M_UDMABUF);
 }
 
 static int udmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
