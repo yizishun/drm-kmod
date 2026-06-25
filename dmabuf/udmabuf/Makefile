@@ -22,9 +22,6 @@ CFLAGS+= -I${SYSDIR}/compat/linuxkpi/dummy/include
 CFLAGS+= '-DKBUILD_MODNAME="${KMOD}"'
 CFLAGS+= ${KCONFIG:C/(.*)/-DCONFIG_\1/}
 
-INCS=	udmabuf.h
-INCSDIR=	${INCLUDEDIR}/udmabuf
-
 CWARNFLAGS.udmabuf.c+=	-Wno-pointer-arith
 
 .include <bsd.kmod.mk>

@@ -87,3 +87,9 @@ vmwgfx/i386
 vmwgfx/x86
 vmwgfx/machine
 vmwgfx/export_syms
+tests/dmabuf/.depend.*
+tests/dmabuf/Kyuafile
+tests/dmabuf/udmabuf
+tests/dmabuf/udmabuf.debug
+tests/dmabuf/udmabuf.full
+tests/dmabuf/udmabuf.pieo
