@@ -14,6 +14,10 @@
 #include <netlink/netlink_generic.h>
 #include <netlink/netlink_message_parser.h>
 
+/* Override some linux definition */
+#undef _SYS_QUEUE_H_
+#undef LIST_HEAD
+#include <sys/queue.h>
 #undef file
 #undef fget
 
@@ -75,7 +79,23 @@ NL_DECLARE_PARSER(udmabuf_item_parser, struct genlmsghdr, nlf_p_empty, nla_p_ite
 
 struct udmabuf {
 	vm_pindex_t count;
+
+	/* TODO: When https://reviews.freebsd.org/D53440 lands, we should refactor some code. */
 	vm_page_t* pages;
+
+	struct mtx udmabuf_mtx; /* for attachments */
+	LIST_HEAD(, udmabuf_attachment) attachments;
+};
+
+#define UDMABUF_AT_LIST_LOCK(ubuf) \
+	mtx_lock(&ubuf->udmabuf_mtx)
+#define UDMABUF_AT_LIST_UNLOCK(ubuf) \
+	mtx_unlock(&ubuf->udmabuf_mtx)
+
+struct udmabuf_attachment {
+	struct device *dev;
+	struct sg_table *sgt;
+	LIST_ENTRY(udmabuf_attachment) attachment;
 };
 
 struct udmabuf_args {
@@ -122,19 +142,28 @@ static struct sg_table * udmabuf_map(struct dma_buf_attachment *attachment,
 	int err = 0;
 	struct sg_table *sgt;
 	struct udmabuf *ubuf;
+	struct udmabuf_attachment *ubuf_at;
 	
 	ubuf = attachment->dmabuf->priv;
 	if (ubuf == NULL)
 		return (ERR_PTR(-EINVAL));
 
-	sgt = malloc(sizeof(struct sg_table), M_UDMABUF, M_NOWAIT|M_ZERO);
-	if (sgt == NULL)
+	ubuf_at = malloc(sizeof(struct udmabuf_attachment), M_UDMABUF,
+	    M_NOWAIT|M_ZERO);
+	if (ubuf_at == NULL)
 		return (ERR_PTR(-ENOBUFS));
+
+	sgt = malloc(sizeof(struct sg_table), M_UDMABUF, M_NOWAIT|M_ZERO);
+	if (sgt == NULL) {
+		free(ubuf_at, M_UDMABUF);
+		return (ERR_PTR(-ENOBUFS));
+	}
 
 	err = sg_alloc_table_from_pages(sgt, ubuf->pages, ubuf->count, 0,
 	    ubuf->count << PAGE_SHIFT, GFP_KERNEL);
 	if (err != 0) {
 		free(sgt, M_UDMABUF);
+		free(ubuf_at, M_UDMABUF);
 		return (ERR_PTR(err));
 	}
 
@@ -142,8 +171,19 @@ static struct sg_table * udmabuf_map(struct dma_buf_attachment *attachment,
 	if (err != 0) {
 		sg_free_table(sgt);
 		free(sgt, M_UDMABUF);
+		free(ubuf_at, M_UDMABUF);
 		return (ERR_PTR(err));
 	}
+
+	ubuf_at->dev = attachment->dev;
+	ubuf_at->sgt = sgt;
+
+	UDMABUF_AT_LIST_LOCK(ubuf);
+	LIST_INSERT_HEAD(&ubuf->attachments, ubuf_at, attachment);
+	UDMABUF_AT_LIST_UNLOCK(ubuf);
+
+	attachment->priv = ubuf_at;
+
 	return sgt;
 }
 
@@ -151,6 +191,13 @@ static void udmabuf_unmap(struct dma_buf_attachment *attachment,
 					struct sg_table *sgt,
 					enum dma_data_direction dir)
 {
+	struct udmabuf *ubuf = attachment->dmabuf->priv;
+	struct udmabuf_attachment *ubuf_at = attachment->priv;
+
+	UDMABUF_AT_LIST_LOCK(ubuf);
+	LIST_REMOVE(ubuf_at, attachment);
+	UDMABUF_AT_LIST_UNLOCK(ubuf);
+	free(ubuf_at, M_UDMABUF);
 	dma_unmap_sgtable(attachment->dev, sgt, dir, 0);
 	sg_free_table(sgt);
 	free(sgt, M_UDMABUF);
@@ -187,13 +234,25 @@ static void udmabuf_vunmap(struct dma_buf *dmabuf, struct iosys_map *map)
 
 static int udmabuf_begin_cpu(struct dma_buf *dmabuf, enum dma_data_direction dir)
 {
-	// dma_sync_sgtable_for_cpu   [linuxkpi] (not supported)
+	struct udmabuf *ubuf = dmabuf->priv;
+	struct udmabuf_attachment *ubuf_at;
+
+	UDMABUF_AT_LIST_LOCK(ubuf);
+	LIST_FOREACH(ubuf_at, &ubuf->attachments, attachment)
+		dma_sync_sgtable_for_cpu(ubuf_at->dev, ubuf_at->sgt, dir);
+	UDMABUF_AT_LIST_UNLOCK(ubuf);
 	return 0;
 }
 
 static int udmabuf_end_cpu(struct dma_buf *dmabuf, enum dma_data_direction dir)
 {
-	// dma_sync_sgtable_for_device[linuxkpi] (not supported)
+	struct udmabuf *ubuf = dmabuf->priv;
+	struct udmabuf_attachment *ubuf_at;
+
+	UDMABUF_AT_LIST_LOCK(ubuf);
+	LIST_FOREACH(ubuf_at, &ubuf->attachments, attachment)
+		dma_sync_sgtable_for_device(ubuf_at->dev, ubuf_at->sgt, dir);
+	UDMABUF_AT_LIST_UNLOCK(ubuf);
 	return 0;
 }
 
@@ -202,6 +261,10 @@ udmabuf_release(struct dma_buf *buf)
 {
 	struct udmabuf *ubuf = buf->priv;
 
+	KASSERT(LIST_EMPTY(&ubuf->attachments),
+	    "udmabuf released with active attachments");
+
+	mtx_destroy(&ubuf->udmabuf_mtx);
 	udmabuf_unwire_pages(ubuf);
 	free(ubuf->pages, M_UDMABUF);
 	free(ubuf, M_UDMABUF);
@@ -296,6 +359,9 @@ udmabuf_export(struct udmabuf_args args, int *fd, struct thread *td)
 	ubuf = malloc(sizeof(struct udmabuf), M_UDMABUF,
 	    M_WAITOK | M_ZERO);
 
+	LIST_INIT(&ubuf->attachments);
+	mtx_init(&ubuf->udmabuf_mtx, "udmabuf mtx", NULL, MTX_DEF);
+
 	ubuf->pages = mallocarray(nr_pages, sizeof(vm_page_t), 
 	    M_UDMABUF, M_WAITOK);
 
@@ -352,6 +418,7 @@ err_unlock:
 	return (err);
 
 err:
+	mtx_destroy(&ubuf->udmabuf_mtx);
 	udmabuf_unwire_pages(ubuf);
 	free(ubuf->pages, M_UDMABUF);
 	free(ubuf, M_UDMABUF);
@@ -419,7 +486,7 @@ udmabuf_create(struct nlmsghdr *hdr, struct nl_pstate *npt)
 	if (err != 0)
 		return (err);
 
-	err = udmabuf_ret_fd(hdr, npt, UDMABUF_CMD_CREATE_LIST, fd);
+	err = udmabuf_ret_fd(hdr, npt, UDMABUF_CMD_CREATE, fd);
 	if (err != 0){
 		kern_close(curthread, fd);
 		return (err);
