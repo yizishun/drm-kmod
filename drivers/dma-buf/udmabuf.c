@@ -7,7 +7,10 @@
 #include <vm/vm_page.h>
 
 #include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 #include "udmabuf.h" /* XXX: where should this header be placed? */
+#include "linux/iosys-map.h"
+#include "linux/vmalloc.h"
 
 #include <netlink/netlink.h>
 #include <netlink/netlink_ctl.h>
@@ -217,19 +220,22 @@ static int udmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 
 static int udmabuf_vmap(struct dma_buf *dmabuf, struct iosys_map *map)
 {
-	// dma_resv_assert_held      [linuxkpi]
-	// vmap			     [linuxkpi] (Optional)
-	// vm_map_ram                [linuxkpi] (not supported)
-	// iosys_map_set_vaddr       [linuxkpi]
+	struct udmabuf *ubuf = dmabuf->priv;
+	void *va;
+
+	dma_resv_assert_held(dmabuf->resv);
+
+	va = vmap(ubuf->pages, ubuf->count, 0, PAGE_KERNEL);
+	if (va == NULL)
+		return (-ENOBUFS);
+	iosys_map_set_vaddr(map, va);
 	return 0;
 }
 
 static void udmabuf_vunmap(struct dma_buf *dmabuf, struct iosys_map *map)
 {
-	// dma_resv_assert_held      [linuxkpi]
-	// vunmap                    [linuxkpi] (Optional)
-	// vm_unmap_ram              [linuxkpi] (not supported)
-	
+	dma_resv_assert_held(dmabuf->resv);
+	vunmap(map->vaddr);
 }
 
 static int udmabuf_begin_cpu(struct dma_buf *dmabuf, enum dma_data_direction dir)
