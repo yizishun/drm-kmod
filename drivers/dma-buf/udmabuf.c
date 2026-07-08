@@ -5,12 +5,12 @@
 
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
+#include <vm/vm_pager.h>
 
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
+#include <linux/vmalloc.h>
 #include "udmabuf.h" /* XXX: where should this header be placed? */
-#include "linux/iosys-map.h"
-#include "linux/vmalloc.h"
 
 #include <netlink/netlink.h>
 #include <netlink/netlink_ctl.h>
@@ -80,11 +80,24 @@ static const struct nlattr_parser nla_p_item[] = {
 #undef _OUT
 NL_DECLARE_PARSER(udmabuf_item_parser, struct genlmsghdr, nlf_p_empty, nla_p_item);
 
+static int udmabuf_cdev_pager_ctor(void *handle, vm_ooffset_t size, vm_prot_t prot,
+		      vm_ooffset_t foff, struct ucred *cred, u_short *color);
+static void udmabuf_cdev_pager_dtor(void *handle);
+static int udmabuf_cdev_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, 
+    int prot, vm_page_t *mres);
+static struct cdev_pager_ops udmabuf_cdev_pager_ops =
+{
+	.cdev_pg_fault	= udmabuf_cdev_pager_fault,
+	.cdev_pg_ctor	= udmabuf_cdev_pager_ctor,
+	.cdev_pg_dtor	= udmabuf_cdev_pager_dtor
+};
+
 struct udmabuf {
 	vm_pindex_t count;
 
 	/* TODO: When https://reviews.freebsd.org/D53440 lands, we should refactor some code. */
 	vm_page_t* pages;
+	struct file *fp;
 
 	struct mtx udmabuf_mtx; /* for attachments */
 	LIST_HEAD(, udmabuf_attachment) attachments;
@@ -206,14 +219,82 @@ static void udmabuf_unmap(struct dma_buf_attachment *attachment,
 	free(sgt, M_UDMABUF);
 }
 
+static int
+udmabuf_cdev_pager_ctor(void *handle, vm_ooffset_t size, vm_prot_t prot,
+		      vm_ooffset_t foff, struct ucred *cred, u_short *color)
+{
+	struct udmabuf *ubuf = handle;
+	MPASS(ubuf->fp != NULL);
+	if(!fhold(ubuf->fp))
+		return (EBADF);
+	*color = 0;
+	return (0);
+}
+
+static void
+udmabuf_cdev_pager_dtor(void *handle)
+{
+	struct udmabuf *ubuf = handle;
+	MPASS(ubuf->fp != NULL);
+	fdrop(ubuf->fp, curthread);
+}
+
+static int
+udmabuf_cdev_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, 
+    int prot, vm_page_t *mres)
+{
+	struct udmabuf *ubuf = vm_obj->handle;
+	vm_pindex_t pgoff = offset >> PAGE_SHIFT;
+	vm_page_t ubuf_pg, res_pg;
+	vm_paddr_t paddr;
+
+	if (pgoff >= ubuf->count)
+		return (VM_PAGER_FAIL);
+	ubuf_pg = ubuf->pages[pgoff];
+
+	paddr = ubuf_pg->phys_addr;
+
+	if (((*mres)->flags & PG_FICTITIOUS) != 0) {
+		/*
+		 * If the passed in result page is a fake
+		 * page, update it with the new physical
+		 * address.
+		 */
+		res_pg = *mres;
+		vm_page_updatefake(res_pg, paddr, vm_obj->memattr);
+	} else {
+		/*
+		 * Replace the passed in "mres" page with our
+		 * own fake page and free up the all of the
+		 * original pages.
+		 */
+		VM_OBJECT_WUNLOCK(vm_obj);
+		res_pg = vm_page_getfake(paddr, vm_obj->memattr);
+		VM_OBJECT_WLOCK(vm_obj);
+
+		vm_page_replace(res_pg, vm_obj, (*mres)->pindex, *mres);
+		*mres = res_pg;
+	}
+	vm_page_valid(res_pg);
+	return (VM_PAGER_OK);
+}
+
 static int udmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 {
-	// vm_insert_pages           [linuxkpi] (not supported) (Optional)
+	struct udmabuf *ubuf = dmabuf->priv;
+	vm_size_t size;
+	vm_ooffset_t offset;
 
-	// vm_flags_set              [linuxkpi]
-	// page_to_pfn               [linuxkpi]
-	// vmf_insert_pfn            [linuxkpi] (not supported)
-	// vmf_insert_pfn_prot       [linuxkpi]
+	size = vma->vm_end - vma->vm_start;
+	offset = vma->vm_pgoff << PAGE_SHIFT;
+	
+	ubuf->fp = dmabuf->linux_file;
+
+	vma->vm_obj = cdev_pager_allocate(ubuf, OBJT_DEVICE,
+		    &udmabuf_cdev_pager_ops, size, vma->vm_page_prot, offset,
+			curthread->td_ucred);
+	if (vma->vm_obj == NULL)
+		return (-EINVAL);
 
 	return 0;
 }
