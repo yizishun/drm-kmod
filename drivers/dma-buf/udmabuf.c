@@ -1,4 +1,8 @@
-// TODO: License
+/*
+ * Copyright (c) 2026 Zishun Yi <zis@freebsd.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
 #include <sys/param.h>
 #include <sys/mman.h>
 #include <sys/rwlock.h>

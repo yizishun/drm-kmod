@@ -1,4 +1,8 @@
-// TODO: License
+/*
+ * Copyright (c) 2026 Zishun Yi <zis@freebsd.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
 #ifndef _UAPI_LINUX_UDMABUF_H
 #define _UAPI_LINUX_UDMABUF_H
 

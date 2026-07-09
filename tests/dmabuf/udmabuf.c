@@ -1,4 +1,8 @@
-// TODO: add license
+/*
+ * Copyright (c) 2026 Zishun Yi <zis@freebsd.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
 
 /*
  * The FreeBSD kernel udmabuf driver now uses Generic Netlink instead of
