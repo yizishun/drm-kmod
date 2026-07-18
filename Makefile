@@ -63,5 +63,6 @@ _INVALID_ARCH_KMODS+=	${var}
 .endif
 
 SUBDIR=	${KMODS}
+SUBDIR+= tests/dmabuf
 
 .include <bsd.subdir.mk>
